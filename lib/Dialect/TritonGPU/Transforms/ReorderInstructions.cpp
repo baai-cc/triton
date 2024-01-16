@@ -45,42 +45,36 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
     mlir::DominanceInfo dom(m);
-    // Sink conversions into loops when they will increase
-    // register pressure
-    DenseMap<Operation *, Operation *> opToMove;
     auto moveAfter = [](Operation *lhs, Operation *rhs) {
       auto lhsId = getWSRoleId(lhs);
       auto rhsId = getWSRoleId(rhs);
       if (lhsId == rhsId)
         lhs->moveAfter(rhs);
     };
+    // Move convert immediately after oprand ready
+    m.walk([&](triton::gpu::ConvertLayoutOp op) {
+      Operation *argOp = op.getOperand().getDefiningOp();
+      if (!argOp)
+        return;
+      moveAfter(op, argOp);
+    });
+    // reduce register pressure
+    // delay loading from shared memory to register,
+    // but never crossing loop
+    DenseMap<Operation *, Operation *> opToMove;
     m.walk([&](triton::gpu::ConvertLayoutOp op) {
       if (!willIncreaseRegisterPressure(op))
         return;
       auto user_begin = op->user_begin();
-      auto user_end = op->user_end();
-      if (std::distance(user_begin, user_end) != 1)
-        return;
-      if (user_begin->getParentOfType<scf::ForOp>() ==
+      if (user_begin->getParentOfType<scf::ForOp>() !=
           op->getParentOfType<scf::ForOp>())
         return;
       opToMove.insert({op, *user_begin});
     });
     for (auto &kv : opToMove)
       kv.first->moveBefore(kv.second);
-    // Move convert(load) immediately after dependent load
-    m.walk([&](triton::gpu::ConvertLayoutOp op) {
-      auto dstType = op.getResult().getType().cast<RankedTensorType>();
-      auto dstEncoding = dstType.getEncoding();
-      if (!dstEncoding.isa<triton::gpu::SharedEncodingAttr>())
-        return;
-      Operation *argOp = op.getOperand().getDefiningOp();
-      if (!argOp)
-        return;
-      moveAfter(op, argOp);
-    });
-    // Move transpositions just after their definition
     opToMove.clear();
+    // Move transpositions just after their definition
     m.walk([&](triton::TransOp op) {
       Operation *argOp = op.getOperand().getDefiningOp();
       if (!argOp)
