@@ -45,8 +45,6 @@ public:
   void runOnOperation() override {
     ModuleOp m = getOperation();
     mlir::DominanceInfo dom(m);
-    // Sink conversions into loops when they will increase
-    // register pressure
     DenseMap<Operation *, Operation *> opToMove;
     auto moveAfter = [](Operation *lhs, Operation *rhs) {
       auto lhsId = getWSRoleId(lhs);
@@ -54,20 +52,6 @@ public:
       if (lhsId == rhsId)
         lhs->moveAfter(rhs);
     };
-    m.walk([&](triton::gpu::ConvertLayoutOp op) {
-      if (!willIncreaseRegisterPressure(op))
-        return;
-      auto user_begin = op->user_begin();
-      auto user_end = op->user_end();
-      if (std::distance(user_begin, user_end) != 1)
-        return;
-      if (user_begin->getParentOfType<scf::ForOp>() ==
-          op->getParentOfType<scf::ForOp>())
-        return;
-      opToMove.insert({op, *user_begin});
-    });
-    for (auto &kv : opToMove)
-      kv.first->moveBefore(kv.second);
     // Move convert(load) immediately after dependent load
     m.walk([&](triton::gpu::ConvertLayoutOp op) {
       auto dstType = op.getResult().getType().cast<RankedTensorType>();
@@ -79,8 +63,39 @@ public:
         return;
       moveAfter(op, argOp);
     });
-    // Move transpositions just after their definition
+    // Sink conversions into loops when they will increase
+    // register pressure
+    m.walk([&](triton::gpu::ConvertLayoutOp op) {
+      if (!willIncreaseRegisterPressure(op))
+        return;
+      Operation *argOp = op.getOperand().getDefiningOp();
+      if (!argOp)
+        return;
+      auto user_begin = op->user_begin();
+      if (user_begin->getParentOfType<scf::ForOp>() ==
+          argOp->getParentOfType<scf::ForOp>())
+        return;
+      // define and use are in different control flow structures, e.g.
+      // %a = ...(define)
+      // %b = convert_layout %a     <- here?
+      // scf.for {
+      //   %b = convert_layout %a   <- or here?
+      //   %c = ...(use %b)
+      // }
+      auto srcType = op.getOperand().getType().cast<RankedTensorType>();
+      auto srcEncoding = srcType.getEncoding();
+      // if this convert op is shared->register or blocked->register,
+      // then bring it out of loop
+      if (srcEncoding.isa<triton::gpu::SharedEncodingAttr>()
+          || srcEncoding.isa<triton::gpu::BlockedEncodingAttr>())
+        op->moveAfter(argOp);
+      else
+        opToMove.insert({op, *user_begin});
+    });
+    for (auto &kv : opToMove)
+      kv.first->moveBefore(kv.second);
     opToMove.clear();
+    // Move transpositions just after their definition
     m.walk([&](triton::TransOp op) {
       Operation *argOp = op.getOperand().getDefiningOp();
       if (!argOp)
