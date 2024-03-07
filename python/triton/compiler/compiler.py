@@ -141,7 +141,6 @@ def optimize_ttgir(mod, num_stages, num_warps, num_ctas, target, cluster_info, e
     pm.add_tritongpu_decompose_conversions_pass()
     pm.add_tritongpu_ws_fixup_missing_attrs_pass()
     pm.add_tritongpu_reorder_instructions_pass()
-    pm.add_tritongpu_remove_layout_conversions_pass()
     pm.add_cse_pass()
     pm.add_symbol_dce_pass()
     if capability // 10 >= 9:
